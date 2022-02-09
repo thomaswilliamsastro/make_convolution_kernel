@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 from astropy.convolution import interpolate_replace_nans, Gaussian2DKernel
 from astropy.io import fits
+from astropy.modeling import models, fitting
 from photutils.centroids import centroid_com
 from scipy.ndimage import rotate, zoom
 
@@ -42,6 +43,39 @@ def get_pixscale(hdu):
     raise Warning('No pixel scale found')
 
 
+def fit_2d_gaussian(data, pixscale=None):
+    """Fit 2D Gaussian to PSF.
+
+    """
+
+    # Normalise to peak of 1
+    data /= np.nanmax(data)
+
+    # Use centre of image for first guess centre, meshgrid up to feed into modelling
+    i_cen = (data.shape[0] - 1) / 2
+    j_cen = (data.shape[1] - 1) / 2
+
+    ji, ii = np.meshgrid((np.arange(data.shape[1]) - j_cen),
+                         (np.arange(data.shape[0]) - i_cen))
+    if pixscale is not None:
+        ji *= pixscale
+        ii *= pixscale
+
+    # Set up model
+    model = models.Gaussian2D(amplitude=1,
+                              x_mean=0, y_mean=0,
+                              x_stddev=1, y_stddev=1,
+                              theta=0
+                              )
+    fitter = fitting.LevMarLSQFitter()
+    fit = fitter(model, ji, ii, data)
+
+    # Take FWHM from mean of the stddevs
+    fwhm = 2.355 * (fit.x_stddev.value + fit.y_stddev.value) / 2
+
+    return fwhm
+
+
 def interp_nans(data, x_stddev=2):
     """Interpolate over any NaNs present in an image.
 
@@ -66,19 +100,18 @@ def interp_nans(data, x_stddev=2):
 
 def centroid(data):
 
-    x_range, y_range = data.shape
+    i_cen = (data.shape[0] - 1) / 2
+    j_cen = (data.shape[1] - 1) / 2
 
-    x_cen, y_cen = centroid_com(data)
-    x_cen = int(np.round(x_cen))
-    y_cen = int(np.round(y_cen))
+    j_centroid, i_centroid = centroid_com(data)
 
     # Shift the PSF to centre it
 
-    x_shift = int(x_range / 2) - x_cen
-    y_shift = int(y_range / 2) - y_cen
+    i_shift = int(np.round(i_cen - i_centroid))
+    j_shift = int(np.round(j_cen - j_centroid))
 
-    data = np.roll(data, x_shift, axis=1)
-    data = np.roll(data, y_shift, axis=0)
+    data = np.roll(data, i_shift, axis=0)
+    data = np.roll(data, j_shift, axis=1)
 
     return data
 
@@ -121,8 +154,8 @@ def circularise(data, rotations=14):
     # Set anything outside the maximum radius contained within the whole square to be 0
 
     radius = np.min(data.shape) / 2
-    i_cen = data.shape[0] / 2
-    j_cen = data.shape[1] / 2
+    i_cen = (data.shape[0] - 1) / 2
+    j_cen = (data.shape[1] - 1) / 2
 
     ji, ii = np.meshgrid((np.arange(data.shape[1]) - j_cen),
                          (np.arange(data.shape[0]) - i_cen))
@@ -235,8 +268,8 @@ def high_pass_filter(data, fwhm, pixscale=0.1):
 
     k_b = 8 * np.pi / (fwhm * pixscale)
     k_a = 0.9 * k_b
-    i_cen = data.shape[0] / 2
-    j_cen = data.shape[1] / 2
+    i_cen = (data.shape[0] - 1) / 2
+    j_cen = (data.shape[1] - 1) / 2
 
     ji, ii = np.meshgrid((np.arange(data.shape[1]) - j_cen),
                          (np.arange(data.shape[0]) - i_cen))
@@ -264,14 +297,15 @@ def low_pass_filter(data, pixscale=0.1):
     i_range = data.shape[0]
     j_range = data.shape[1]
 
-    data_slice = data[int(i_range / 2):, int(j_range / 2)]
+    data_slice = data[int((i_range - 1) / 2):,
+                      int((j_range - 1) / 2)]
     data_slice_max = np.nanmax(data_slice)
 
     k_h = np.where(data_slice < 0.005 * data_slice_max)[0][0] * pixscale
     k_l = 0.7 * k_h
 
-    i_cen = data.shape[0] / 2
-    j_cen = data.shape[1] / 2
+    i_cen = (data.shape[0] - 1) / 2
+    j_cen = (data.shape[1] - 1) / 2
 
     ji, ii = np.meshgrid((np.arange(data.shape[1]) - j_cen),
                          (np.arange(data.shape[0]) - i_cen))
@@ -321,14 +355,24 @@ class MakeConvolutionKernel:
         self.source_psf = copy.deepcopy(source_psf.data)
         self.target_psf = copy.deepcopy(target_psf.data)
 
+        self.source_pixscale = get_pixscale(source_psf)
+        self.target_pixscale = get_pixscale(target_psf)
+
+        if not source_fwhm:
+            print('source_fwhm not supplied. Fitting using 2D Gaussian')
+            source_fwhm = fit_2d_gaussian(data=self.source_psf, pixscale=self.source_pixscale)
+        if not target_fwhm:
+            print('target_fwhm not supplied. Fitting using 2D Gaussian')
+            target_fwhm = fit_2d_gaussian(data=self.target_psf, pixscale=self.target_pixscale)
+
+        if source_fwhm >= target_fwhm:
+            raise Warning('Cannot create kernel from lower to higher resolution data!')
+
         self.source_fwhm = copy.deepcopy(source_fwhm)
         self.target_fwhm = copy.deepcopy(target_fwhm)
 
         self.source_name = copy.deepcopy(source_name)
         self.target_name = copy.deepcopy(target_name)
-
-        self.source_pixscale = get_pixscale(source_psf)
-        self.target_pixscale = get_pixscale(target_psf)
 
         self.common_pixscale = copy.deepcopy(common_pixscale)
 
@@ -390,7 +434,6 @@ class MakeConvolutionKernel:
         target_fourier_high_pass = high_pass_filter(self.target_fourier, self.target_fwhm, self.common_pixscale / 2)
 
         # Invert the source fourier, any infs go to 0
-
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
             source_fourier_invert = source_fourier_high_pass ** -1
@@ -404,8 +447,9 @@ class MakeConvolutionKernel:
         self.kernel_fourier = target_fourier_high_pass * (source_fourier_low_pass * source_fourier_invert)
         self.kernel_fourier = np.fft.ifftshift(self.kernel_fourier)
 
-        # IFFT to kernel
+        # IFFT to kernel and round out any tiny computational errors
         self.kernel = np.fft.fftshift(np.real(np.fft.ifft2(self.kernel_fourier)))
+        self.kernel[np.abs(self.kernel) <= np.finfo(float).eps] = 0
 
         # Centroid again, just in case
         self.kernel = centroid(self.kernel)
