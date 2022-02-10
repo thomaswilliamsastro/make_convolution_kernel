@@ -99,7 +99,6 @@ def interp_nans(data, x_stddev=2):
 
 
 def centroid(data):
-
     i_cen = (data.shape[0] - 1) / 2
     j_cen = (data.shape[1] - 1) / 2
 
@@ -179,6 +178,9 @@ def resize(data, pixscale, grid_size_arcsec=None):
         grid_size_arcsec:
 
     Returns:
+
+    TODO:
+        * Will fail on non-square arrays
 
     """
 
@@ -297,8 +299,10 @@ def low_pass_filter(data, pixscale=0.1):
     i_range = data.shape[0]
     j_range = data.shape[1]
 
-    data_slice = data[int((i_range - 1) / 2):,
-                      int((j_range - 1) / 2)]
+    data_slice = data[
+                 int((i_range - 1) / 2):,
+                 int((j_range - 1) / 2)
+                 ]
     data_slice_max = np.nanmax(data_slice)
 
     k_h = np.where(data_slice < 0.005 * data_slice_max)[0][0] * pixscale
@@ -320,6 +324,43 @@ def low_pass_filter(data, pixscale=0.1):
     data_filter[ri <= k_l] = 1
 
     return data_filter
+
+
+def trim_kernel_energy(kernel, energy_tol=0.999):
+    """ Trim kernel based on enclosed energy to speed up later convolutions/space requirements
+
+    Args:
+        kernel:
+        energy_tol:
+
+    Returns:
+
+    TODO:
+        * This could fail is the kernel is too small/too big. Keep an eye out
+
+    """
+    kernel_radius = int((kernel.shape[0] - 1) / 2)
+
+    i_cen = (kernel.shape[0] - 1) / 2
+    j_cen = (kernel.shape[1] - 1) / 2
+    ji, ii = np.meshgrid((np.arange(kernel.shape[1]) - j_cen),
+                         (np.arange(kernel.shape[0]) - i_cen))
+
+    ri = np.sqrt(ji ** 2 + ii ** 2)
+
+    total_kernel_energy = np.nansum(np.abs(kernel[ri <= kernel_radius]))
+
+    for radius in range(kernel_radius):
+        idx = np.where(ri <= radius)
+        enclosed_energy = np.nansum(np.abs(kernel[idx]))
+        frac_kernel_energy = enclosed_energy / total_kernel_energy
+        if frac_kernel_energy >= energy_tol:
+            break
+    trim_shape = (radius * 2 + 1, radius * 2 + 1)
+
+    kernel_trimmed = trim(kernel, trim_shape)
+
+    return kernel_trimmed
 
 
 class MakeConvolutionKernel:
@@ -382,7 +423,7 @@ class MakeConvolutionKernel:
         self.kernel_fourier = None
         self.kernel = None
 
-    def make_convolution_kernel(self, kernel_energy_tol=0.999):
+    def make_convolution_kernel(self):
         """Short desc
 
         Long desc
@@ -454,19 +495,8 @@ class MakeConvolutionKernel:
         # Centroid again, just in case
         self.kernel = centroid(self.kernel)
 
-        # Trim kernel to optimize space/speed
-        total_kernel_energy = np.nansum(np.abs(self.kernel))
-
-        frac_kernel_energy = 1
-        pix_to_trim = 0
-        while frac_kernel_energy > kernel_energy_tol:
-            pix_to_trim += 1
-            kernel_cutout = self.kernel[pix_to_trim:self.kernel.shape[0] - pix_to_trim,
-                                        pix_to_trim:self.kernel.shape[1] - pix_to_trim]
-            cutout_kernel_energy = np.nansum(np.abs(kernel_cutout))
-            frac_kernel_energy = cutout_kernel_energy / total_kernel_energy
-
-        self.kernel = trim(self.kernel, np.asarray(self.kernel.shape) - pix_to_trim * 2)
+        # Trim kernel based on enclosed energy
+        self.kernel = trim_kernel_energy(self.kernel)
 
         # Finally, circularise kernel and normalise to peak of 1
         self.kernel = circularise(self.kernel)
